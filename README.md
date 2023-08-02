@@ -11,6 +11,7 @@ The code expects [`tokenizer.bin`](https://github.com/karpathy/llama2.c/raw/mast
 
 Currently, there isn't anything original here. I'll continue improving it (e.g. use the Java Vector API) while
 keeping it in sync with the original. This is a baseline implementation to gather preliminary performance data on the JVM.
+This port is used [llama2.scala](https://github.com/jrudolph/llama2.scala) as a reference.
 
 ## Performance
 
