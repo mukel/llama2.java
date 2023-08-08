@@ -82,7 +82,7 @@ This difference barely affects larger models e.g. >= `stories110M.bin` but is ve
 
 ****Notes**  
 *The **~4X** difference, consistent across benchmarks, is due to the vectorization of matmul, which the Java implementation lacks.
-Surprinsingly, neither C2 nor Graal auto-vectorization optimizations are applied in matmul.*
+Surprisingly, neither C2 nor Graal auto-vectorization optimizations are applied in matmul.*
 
 ### Multi-threaded
 
