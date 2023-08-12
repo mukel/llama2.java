@@ -58,10 +58,11 @@ make native-image
 
 ## Performance
 
-Quick numbers on an AMD Ryzen 3950X 64GB, Linux:
-`llama2.java` executed on Oracle GraalVM 20 (23.0.1)
-All programs are executed with [nucleus sampling](https://arxiv.org/pdf/1904.09751.pdf) disabled (e.g. `-p 0`), since the Java version implements a faster algorithm.
-This difference barely affects larger models e.g. >= `stories110M.bin` but is very noticeable in smaller models.  
+Quick numbers on an AMD Ryzen 3950X 64GB, Arch Linux.  
+`llama2.java` executed on OpenJDK 20.0.2+9.  
+To make things fair w.r.t. to vectorization, the Java version has a matmul implementation using the [Vector API](https://openjdk.org/jeps/448).  
+In these measurements the JVM is warmed up enough to reach peak tokens/s.  
+On GraalVM, please note that the Graal compiler doesn't support the Vector API yet, to avoid unexpected performance degradation, run with `-Dllama2.VectorAPI=false`.
 
 ****Notes**  
 *The numbers below were collected using aggressive (gcc) compiler flags e.g. regular `gcc -O2 ...` wouldn't be as fast.*
@@ -74,11 +75,11 @@ This difference barely affects larger models e.g. >= `stories110M.bin` but is ve
 | Implementation | Model | Tokens per second | Speedup vs. llama2.c |
 | ---------------| ------|------------------ | -------------------- |
 | llama2.c    | stories15M.bin  |   363 |  1.0 |
-| llama2.java | stories15M.bin  |    86 | 0.23 |
-| llama2.c    | stories110M.bin | 52.76 |  1.0 |
-| llama2.java | stories110M.bin | 12.89 | 0.24 |
-| llama2.c    | llama2_7B.bin   |  0.93 |  1.0 |
-| llama2.java | llama2_7B.bin   |  0.21 | 0.23 |
+| llama2.java | stories15M.bin  |   237 | 0.65 |
+| llama2.c    | stories110M.bin | 51.71 |  1.0 |
+| llama2.java | stories110M.bin | 42.20 | 0.81 |
+| llama2.c    | llama2_7B.bin   |  0.92 |  1.0 |
+| llama2.java | llama2_7B.bin   |  0.88 | 0.95 |
 
 ****Notes**  
 *The **~4X** difference, consistent across benchmarks, is due to the vectorization of matmul, which the Java implementation lacks.
@@ -86,16 +87,18 @@ Surprisingly, neither C2 nor Graal auto-vectorization optimizations are applied 
 
 ### Multi-threaded
 
-`llama2.c` compiled with `gcc -Ofast -fopenmp -march=native run.c -lm -o run -march=native`
+`llama2.c` compiled with `gcc -Ofast -fopenmp -march=native run.c -lm -o run -march=native`  
+`llama2.c` executed with `OMP_NUM_THREADS=8`  
+`llama2.java` executed with `-Djava.util.concurrent.ForkJoinPool.common.parallelism=8`  
 
 | Implementation | Model | Tokens per second | Speedup vs. llama2.c |
 | ---------------| ------|------------------ | -------------------- |
 | llama2.c    |  stories15M.bin |  1233 |  1.0 |
-| llama2.java |  stories15M.bin |   309 | 0.25 |
-| llama2.c    | stories110M.bin | 56.60 |  1.0 |
-| llama2.java | stories110M.bin | 65.85 | **1.16** |
-| llama2.c    |   llama2_7B.bin |  1.64 |  1.0 |
-| llama2.java |   llama2_7B.bin |  1.56 | 0.95 |
+| llama2.java |  stories15M.bin |   438 | 0.35 |
+| llama2.c    | stories110M.bin |    90 |  1.0 |
+| llama2.java | stories110M.bin |    80 | 0.88 |
+| llama2.c    |   llama2_7B.bin |  1.68 |  1.0 |
+| llama2.java |   llama2_7B.bin |  1.65 | 0.98 |
 
 ****Notes**  
 *In `stories15M.bin`, the C version shows a huge speedup, very likely a cache effect, this is considered an outlier.
