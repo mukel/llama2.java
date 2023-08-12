@@ -543,7 +543,7 @@ class Llama2 {
         System.err.println("Example: java Lamma2 model.bin -n 256 -i \"Once upon a time\"");
         System.err.println("Options:");
         System.err.println("  -t <float>  temperature, default 1.0");
-        System.err.println("  -p <float>  p value in top-p (nucleus) sampling. default 0.9, 0 = off");
+        System.err.println("  -p <float>  p value in top-p (nucleus) sampling. default 1.0 (=off)");
         System.err.println("  -s <int>    random seed, default time(NULL)");
         System.err.println("  -n <int>    number of steps to run for, default 256. 0 = max_seq_len");
         System.err.println("  -i <string> input prompt\n");
@@ -555,8 +555,8 @@ class Llama2 {
         // default inits
         String checkpoint = null; // e.g. out/model.bin
         float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-        float topp = 0.9f;        // top-p in nucleus sampling
-        rng_seed = System.currentTimeMillis() / 1000; // (unsigned int)time(NULL);
+        float topp = 1.0f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+        rng_seed = 0;             // seed rng with time by default
         int steps = 256;          // max number of steps to run for, 0: use seq_len
         String prompt = null;     // prompt string
 
@@ -583,8 +583,7 @@ class Llama2 {
         }
 
         if (rng_seed == 0) {
-            System.err.println("Cannot use seed=0 because of the rng alg used");
-            System.exit(1);
+            rng_seed =  System.currentTimeMillis();
         }
 
         FileChannel fileChannel = FileChannel.open(Paths.get(checkpoint), StandardOpenOption.READ);
@@ -656,7 +655,7 @@ class Llama2 {
                     // apply softmax to the logits to get the probabilities for next token
                     softmax(state.logits, 0, config.vocab_size);
                     // we sample from this distribution to get the next token
-                    if (topp <= 0) {
+                    if (topp <= 0 || topp >= 1) {
                         // simply sample from the predicted probability distribution
                         next = sample(state.logits, config.vocab_size);
                     } else {
