@@ -81,10 +81,6 @@ On GraalVM, please note that the Graal compiler doesn't support the Vector API y
 | llama2.c    | llama2_7B.bin   |  0.92 |  1.0 |
 | llama2.java | llama2_7B.bin   |  0.88 | 0.95 |
 
-****Notes**  
-*The **~4X** difference, consistent across benchmarks, is due to the vectorization of matmul, which the Java implementation lacks.
-Surprisingly, neither C2 nor Graal auto-vectorization optimizations are applied in matmul.*
-
 ### Multi-threaded
 
 `llama2.c` compiled with `gcc -Ofast -fopenmp -march=native run.c -lm -o run -march=native`  
