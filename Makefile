@@ -10,9 +10,9 @@ JAVA ?= java
 JAR ?= jar
 NATIVE_IMAGE ?= native-image
 
-JAVA_COMPILE_OPTIONS = --enable-preview -source 20 -g
-JAVA_RUNTIME_OPTIONS += --enable-preview
-NATIVE_IMAGE_OPTIONS += --enable-preview
+JAVA_COMPILE_OPTIONS = --enable-preview -source 20 -g --add-modules jdk.incubator.vector
+JAVA_RUNTIME_OPTIONS += --enable-preview --add-modules jdk.incubator.vector
+NATIVE_IMAGE_OPTIONS += --enable-preview --add-modules jdk.incubator.vector
 
 JAVA_MAIN_CLASS = Llama2
 JAR_FILE = llama2.jar
