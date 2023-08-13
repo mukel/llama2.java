@@ -579,6 +579,7 @@ class Llama2 {
         System.err.println("  -s <int>    random seed, default time(NULL)");
         System.err.println("  -n <int>    number of steps to run for, default 256. 0 = max_seq_len");
         System.err.println("  -i <string> input prompt\n");
+        System.err.println("  -z <string> optional path to custom tokenizer");
         System.exit(1);
     }
 
@@ -586,6 +587,7 @@ class Llama2 {
 
         // default inits
         String checkpoint = null; // e.g. out/model.bin
+        String tokenizer = "tokenizer.bin";
         float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
         float topp = 1.0f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
         rng_seed = 0;             // seed rng with time by default
@@ -610,6 +612,7 @@ class Llama2 {
                 case 's' -> rng_seed = Integer.parseInt(args[i + 1]);
                 case 'n' -> steps = Integer.parseInt(args[i + 1]);
                 case 'i' -> prompt = args[i + 1];
+                case 'z' -> tokenizer = argv[i + 1];
                 default -> error_usage();
             }
         }
@@ -633,10 +636,10 @@ class Llama2 {
             steps = config.seq_len;
         }
 
-        // read in the tokenizer.bin file
+        // read in the tokenizer .bin file
         String[] vocab = new String[config.vocab_size];
         float[] vocab_scores = new float[config.vocab_size];
-        try (FileChannel channel = FileChannel.open(Paths.get("tokenizer.bin"), StandardOpenOption.READ)) {
+        try (FileChannel channel = FileChannel.open(Paths.get(tokenizer), StandardOpenOption.READ)) {
             ByteBuffer tokBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
             tokBuffer.order(ByteOrder.LITTLE_ENDIAN);
             int max_token_length = tokBuffer.getInt();
