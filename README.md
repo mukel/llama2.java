@@ -4,7 +4,7 @@ This is a pure Java port of Andrej Karpathy's awesome [llama2.c](https://github.
 to run inference of models with a [Llama2](https://arxiv.org/pdf/2302.13971.pdf)-like transformer-based LLM architecture.  
 
 <p align="center">
-  <img width="600" src="https://github.com/mukel/llama2.java/assets/1896283/c7db4110-1bf6-466c-9fac-130a6ecefe8a">
+  <img width="600" src="https://github.com/mukel/llama2.java/assets/1896283/66a8a650-f1a9-4540-9587-b112294e5e6b">
 </p>
 
 Currently, there isn't anything really original here, but I'll continue polishing it while keeping it in sync with the original.  
