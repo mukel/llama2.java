@@ -282,7 +282,7 @@ class Llama2 {
             // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
             for (int i = 0; i < dim; i += 2) {
                 float q0 = s.q[i];
-                float q1 = s.q[i+1];                
+                float q1 = s.q[i+1];
                 float fcr = w.freq_cis_real.get(pos * head_size / 2 + (i % head_size) / 2);
                 float fci = w.freq_cis_imag.get(pos * head_size / 2 + (i % head_size) / 2);
                 s.q[i]   = q0 * fcr - q1 * fci;
@@ -522,35 +522,36 @@ class Llama2 {
         }
     }
 
-    static int sample_topp(float[] probabilities, float topp, int[] indices) {
+    static int sample_topp(float[] probabilities, int n, float topp, int[] indices) {
         // top-p sampling (or "nucleus sampling") samples from the smallest set of
         // tokens that exceed probability topp. This way we never sample tokens that
         // have very low probabilities and are less likely to go "off the rails".
         Comparator<Integer> comparator = Comparator.<Integer>comparingDouble(i -> probabilities[i]).reversed();
 
-        final int n = indices.length;
-
-        // Common case: If the largest probability > topp, skip the partial sorting.
-        int maxIndex = 0;
-        for (int i = 1; i < n; ++i) {
-            if (probabilities[i] > probabilities[maxIndex]) {
-                maxIndex = i;
+        int head = 0;
+        int tail = n - 1;
+        // values smaller than (1 - topp) / (n - 1) cannot be part of the result
+        // so for efficiency we crop these out as candidates before sorting
+        float cutoff = (1.0f - topp) / (n - 1);
+        for (int i = 0; i < indices.length; i++) {
+            if (probabilities[i] >= cutoff) {
+                indices[head++] = i;
+            } else {
+                indices[tail--] = i;
             }
         }
-        if (probabilities[maxIndex] > topp) {
-            return maxIndex;
+
+        int n0 = head;
+        // build heap O(n0)
+        for (int i = n0 / 2 - 1; i >= 0; --i) {
+            siftDown(indices, i, n0, comparator);
         }
 
-        // build heap O(n)
-        for (int i = n / 2 - 1; i >= 0; --i) {
-            siftDown(indices, i, n, comparator);
-        }
-
-        // truncate the list where cumulative probability exceeds topp O(k log n)
-        // largest elements are the last k
+        // truncate the list where cumulative probability of the largest k elements exceeds topp
+        // O(k lg n0)
         float cumulative_prob = 0.0f;
-        int last_idx = indices.length - 1;
-        for (int i = indices.length - 1; i > 0; i--) {
+        int last_idx = 0;
+        for (int i = n0 - 1; i >= 0; i--) {
             swap(indices, 0, i);
             cumulative_prob += probabilities[indices[i]];
             if (cumulative_prob > topp) {
@@ -563,7 +564,7 @@ class Llama2 {
         // sample from the truncated list
         float r = random_f32() * cumulative_prob;
         float cdf = 0.0f;
-        for (int i = indices.length - 1; i >= last_idx; i--) {
+        for (int i = n0 - 1; i >= last_idx; i--) {
             cdf += probabilities[indices[i]];
             if (r < cdf) {
                 return indices[i];
@@ -581,7 +582,7 @@ class Llama2 {
         System.err.println("Example: java Lamma2 model.bin -n 256 -i \"Once upon a time\"");
         System.err.println("Options:");
         System.err.println("  -t <float>  temperature, default 1.0");
-        System.err.println("  -p <float>  p value in top-p (nucleus) sampling. default 1.0 (=off)");
+        System.err.println("  -p <float>  p value in top-p (nucleus) sampling. default 0.9");
         System.err.println("  -s <int>    random seed, default time(NULL)");
         System.err.println("  -n <int>    number of steps to run for, default 256. 0 = max_seq_len");
         System.err.println("  -i <string> input prompt\n");
@@ -595,7 +596,7 @@ class Llama2 {
         String checkpoint = null; // e.g. out/model.bin
         String tokenizer = "tokenizer.bin";
         float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-        float topp = 1.0f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+        float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
         rng_seed = 0;             // seed rng with time by default
         int steps = 256;          // max number of steps to run for, 0: use seq_len
         String prompt = null;     // prompt string
@@ -701,7 +702,7 @@ class Llama2 {
                         next = sample(state.logits, config.vocab_size);
                     } else {
                         // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                        next = sample_topp(state.logits, topp, state.indices);
+                        next = sample_topp(state.logits, config.vocab_size, topp, state.indices);
                     }
                 }
             }
