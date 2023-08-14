@@ -72,14 +72,14 @@ On GraalVM, please note that the Graal compiler doesn't support the Vector API y
 `llama2.c` compiled with `gcc -Ofast -march=native run.c -lm -o run -march=native`  
 `llama2.java` executed with `-Djava.util.concurrent.ForkJoinPool.common.parallelism=0`
 
-| Implementation | Model | Tokens per second | Speedup vs. llama2.c |
-| ---------------| ------|------------------ | -------------------- |
-| llama2.c    | stories15M.bin  |   363 |  1.0 |
-| llama2.java | stories15M.bin  |   237 | 0.65 |
-| llama2.c    | stories110M.bin | 51.71 |  1.0 |
-| llama2.java | stories110M.bin | 42.20 | 0.81 |
-| llama2.c    | llama2_7B.bin   |  0.92 |  1.0 |
-| llama2.java | llama2_7B.bin   |  0.88 | 0.95 |
+| Model | Tokens per second | Speedup vs. llama2.c | Implementation |  
+| ------|------------------ | -------------------- | -------------- | 
+| stories15M.bin  |   363 |  1.0 | llama2.c    |
+| stories15M.bin  |   237 | 0.65 | llama2.java |
+| stories110M.bin | 51.71 |  1.0 | llama2.c    |
+| stories110M.bin | 42.20 | 0.81 | llama2.java |
+| llama2_7B.bin   |  0.92 |  1.0 | llama2.c    |
+| llama2_7B.bin   |  0.88 | 0.95 | llama2.java |
 
 ### Multi-threaded
 
@@ -87,14 +87,14 @@ On GraalVM, please note that the Graal compiler doesn't support the Vector API y
 `llama2.c` executed with `OMP_NUM_THREADS=8`  
 `llama2.java` executed with `-Djava.util.concurrent.ForkJoinPool.common.parallelism=8`  
 
-| Implementation | Model | Tokens per second | Speedup vs. llama2.c |
-| ---------------| ------|------------------ | -------------------- |
-| llama2.c    |  stories15M.bin |  1233 |  1.0 |
-| llama2.java |  stories15M.bin |   438 | 0.35 |
-| llama2.c    | stories110M.bin |    90 |  1.0 |
-| llama2.java | stories110M.bin |    80 | 0.88 |
-| llama2.c    |   llama2_7B.bin |  1.68 |  1.0 |
-| llama2.java |   llama2_7B.bin |  1.65 | 0.98 |
+| Model | Tokens per second | Speedup vs. llama2.c | Implementation |  
+| ------|------------------ | -------------------- | -------------- |
+|  stories15M.bin |  1233 |  1.0 | llama2.c    |
+|  stories15M.bin |   438 | 0.35 | llama2.java |
+| stories110M.bin |    90 |  1.0 | llama2.c    |
+| stories110M.bin |    80 | 0.88 | llama2.java |
+|   llama2_7B.bin |  1.68 |  1.0 | llama2.c    |
+|   llama2_7B.bin |  1.65 | 0.98 | llama2.java |
 
 ****Notes**  
 *In `stories15M.bin`, the C version shows a huge speedup, very likely a cache effect, this is considered an outlier.
