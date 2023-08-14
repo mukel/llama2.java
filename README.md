@@ -17,8 +17,8 @@ The code expects [`tokenizer.bin`](https://github.com/karpathy/llama2.c/raw/mast
 
 To build and run manually:
 ```bash
-javac --enable-preview -source 20 Llama2.java
-java --enable-preview Llama2 stories15M.bin
+javac --enable-preview -source 20 --add-modules=jdk.incubator.vector Llama2.java
+java --enable-preview --add-modules=jdk.incubator.vector Llama2 stories15M.bin
 ```
 
 For convenience, a `Makefile` and a `run.sh` script are also provided:
