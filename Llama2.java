@@ -160,8 +160,8 @@ final class RunState {
         this.hb = new float[config.hidden_dim];
         this.hb2 = new float[config.hidden_dim];
         this.q = new float[config.dim];
-        this.k = new float[config.dim];
-        this.v = new float[config.dim];
+        this.k = new float[kv_dim];
+        this.v = new float[kv_dim];
         this.att = new float[config.n_heads * config.seq_len];
         this.logits = new float[config.vocab_size];
         this.key_cache = new float[config.n_layers * config.seq_len * kv_dim];
@@ -174,12 +174,6 @@ class Llama2 {
 
 // ----------------------------------------------------------------------------
 // neural net blocks
-
-    static void accum(float[] a, float[] b, int size) {
-        for (int i = 0; i < size; i++) {
-            a[i] += b[i];
-        }
-    }
 
     static void rmsnorm(float[] o, float[] x, FloatBuffer weight, int size) {
         // calculate sum of squares
@@ -353,7 +347,9 @@ class Llama2 {
             matmul(s.xb2, s.xb, w.wo[l], dim, dim);
 
             // residual connection back into x
-            accum(s.x, s.xb2, dim);
+            for (int i = 0; i < dim; i++) {
+                s.x[i] += s.xb2[i];
+            }
 
             // ffn rmsnorm
             rmsnorm(s.xb, s.x, w.rms_ffn_weight[l], dim);
@@ -377,7 +373,9 @@ class Llama2 {
             matmul(s.xb, s.hb, w.w2[l], p.hidden_dim, dim);
 
             // residual connection
-            accum(s.x, s.xb, dim);
+            for (int i = 0; i < dim; i++) {
+                s.x[i] += s.xb[i];
+            }
         }
 
         // final rmsnorm
