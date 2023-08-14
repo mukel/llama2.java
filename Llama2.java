@@ -74,11 +74,11 @@ final class Weights {
     final FloatBuffer token_embedding_table; // (vocab_size, dim)
     // weights for rmsnorms
     final FloatBuffer[] rms_att_weight; // (layer, dim) rmsnorm weights
-    // weights for matmuls
-    final FloatBuffer[] wq; // (layer, dim, dim)
-    final FloatBuffer[] wk; // (layer, dim, dim)
-    final FloatBuffer[] wv; // (layer, dim, dim)
-    final FloatBuffer[] wo; // (layer, dim, dim)
+    // weights for matmuls. note dim == n_heads * head_size
+    final FloatBuffer[] wq; // (layer, dim, n_heads * head_size)
+    final FloatBuffer[] wk; // (layer, dim, n_kv_heads * head_size)
+    final FloatBuffer[] wv; // (layer, dim, n_kv_heads * head_size)
+    final FloatBuffer[] wo; // (layer, n_heads * head_size, dim)
     final FloatBuffer[] rms_ffn_weight; // (layer, dim)
     // weights for ffn
     final FloatBuffer[] w1; // (layer, hidden_dim, dim)
@@ -118,10 +118,10 @@ final class Weights {
         long[] position = new long[]{0};
         this.token_embedding_table = takeFloats(memorySegment, position, config.vocab_size, config.dim);
         this.rms_att_weight = takeArray(memorySegment, position, config.n_layers, config.dim);
-        this.wq = takeArray(memorySegment, position, config.n_layers, config.dim, config.dim);
-        this.wk = takeArray(memorySegment, position, config.n_layers, config.dim, config.dim);
-        this.wv = takeArray(memorySegment, position, config.n_layers, config.dim, config.dim);
-        this.wo = takeArray(memorySegment, position, config.n_layers, config.dim, config.dim);
+        this.wq = takeArray(memorySegment, position, config.n_layers, config.dim, config.n_heads * config.head_size);
+        this.wk = takeArray(memorySegment, position, config.n_layers, config.dim, config.n_kv_heads * config.head_size);
+        this.wv = takeArray(memorySegment, position, config.n_layers, config.dim, config.n_kv_heads * config.head_size);
+        this.wo = takeArray(memorySegment, position, config.n_layers, config.n_heads * config.head_size, config.dim);
         this.rms_ffn_weight = takeArray(memorySegment, position, config.n_layers, config.dim);
         this.w1 = takeArray(memorySegment, position, config.n_layers, config.hidden_dim, config.dim);
         this.w2 = takeArray(memorySegment, position, config.n_layers, config.dim, config.hidden_dim);
@@ -153,6 +153,7 @@ final class RunState {
     final int[] indices; // (vocab_size)
 
     RunState(Config config) {
+        int kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
         this.x = new float[config.dim];
         this.xb = new float[config.dim];
         this.xb2 = new float[config.dim];
@@ -163,8 +164,8 @@ final class RunState {
         this.v = new float[config.dim];
         this.att = new float[config.n_heads * config.seq_len];
         this.logits = new float[config.vocab_size];
-        this.key_cache = new float[config.n_layers * config.seq_len * config.dim];
-        this.value_cache = new float[config.n_layers * config.seq_len * config.dim];
+        this.key_cache = new float[config.n_layers * config.seq_len * kv_dim];
+        this.value_cache = new float[config.n_layers * config.seq_len * kv_dim];
         this.indices = IntStream.range(0, config.vocab_size).toArray();
     }
 }
@@ -261,6 +262,8 @@ class Llama2 {
         int dim = p.dim;
         int hidden_dim = p.hidden_dim;
         int head_size = p.head_size;
+        int kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+        int kv_mul = p.n_heads / p.n_kv_heads; // integer multiplier of the kv sharing in multiquery
 
         // copy the token embedding into x
         w.token_embedding_table.get(token * dim, s.x, 0, dim);
@@ -273,28 +276,31 @@ class Llama2 {
 
             // qkv matmuls for this position
             matmul(s.q, s.xb, w.wq[l], dim, dim);
-            matmul(s.k, s.xb, w.wk[l], dim, dim);
-            matmul(s.v, s.xb, w.wv[l], dim, dim);
+            matmul(s.k, s.xb, w.wk[l], dim, kv_dim);
+            matmul(s.v, s.xb, w.wv[l], dim, kv_dim);
 
             // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
             for (int i = 0; i < dim; i += 2) {
                 float q0 = s.q[i];
-                float q1 = s.q[i+1];
-                float k0 = s.k[i];
-                float k1 = s.k[i+1];
+                float q1 = s.q[i+1];                
                 float fcr = w.freq_cis_real.get(pos * head_size / 2 + (i % head_size) / 2);
                 float fci = w.freq_cis_imag.get(pos * head_size / 2 + (i % head_size) / 2);
                 s.q[i]   = q0 * fcr - q1 * fci;
                 s.q[i+1] = q0 * fci + q1 * fcr;
+            }
+            for (int i = 0; i < kv_dim; i += 2) {
+                float k0 = s.k[i];
+                float k1 = s.k[i+1];
+                float fcr = w.freq_cis_real.get(pos * head_size / 2 + (i % head_size) / 2);
+                float fci = w.freq_cis_imag.get(pos * head_size / 2 + (i % head_size) / 2);
                 s.k[i]   = k0 * fcr - k1 * fci;
                 s.k[i+1] = k0 * fci + k1 * fcr;
             }
 
             // save key,value at this time step (pos) to our kv cache
-            int loff = l * p.seq_len * dim; // kv cache layer offset for convenience
-
-            System.arraycopy(s.k, 0, s.key_cache, loff + pos * dim, dim);
-            System.arraycopy(s.v, 0, s.value_cache, loff + pos * dim, dim);
+            int loff = l * p.seq_len * kv_dim; // kv cache layer offset for convenience
+            System.arraycopy(s.k, 0, s.key_cache, loff + pos * kv_dim, kv_dim);
+            System.arraycopy(s.v, 0, s.value_cache, loff + pos * kv_dim, kv_dim);
 
             // multihead attention. iterate over all heads
             IntStream.range(0, p.n_heads).parallel().forEach(h -> {
@@ -309,8 +315,8 @@ class Llama2 {
                 // iterate over all timesteps, including the current one
                 for (int t = 0; t <= pos; t++) {
                     // get the key vector for this head and at this timestep
-                    // float* k = s.key_cache + loff + t * dim + h * head_size;
-                    int keyCacheOffset = loff + t * dim + h * head_size;
+                    // float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                    int keyCacheOffset = loff + t * kv_dim + (h / kv_mul) * head_size;
                     // calculate the attention score as the dot product of q and k
                     float score = 0.0f;
                     for (int i = 0; i < head_size; i++) {
@@ -332,8 +338,8 @@ class Llama2 {
 
                 for (int t = 0; t <= pos; t++) {
                     // get the value vector for this head and at this timestep
-                    // float* v = s.value_cache + loff + t * dim + h * head_size;
-                    int vOffset = loff + t * dim + h * head_size;
+                    // float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                    int vOffset = loff + t * kv_dim + (h / kv_mul) * head_size;
                     // get the attention weight for this timestep
                     float a = s.att[attOffset + t];
                     // accumulate the weighted value inconfigto xb
@@ -612,7 +618,7 @@ class Llama2 {
                 case 's' -> rng_seed = Integer.parseInt(args[i + 1]);
                 case 'n' -> steps = Integer.parseInt(args[i + 1]);
                 case 'i' -> prompt = args[i + 1];
-                case 'z' -> tokenizer = argv[i + 1];
+                case 'z' -> tokenizer = args[i + 1];
                 default -> error_usage();
             }
         }
