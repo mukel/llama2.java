@@ -1,12 +1,5 @@
-/*
-Inference for Llama-2 Transformer model in pure Java.
+/* Inference for Llama-2 Transformer model in pure Java */
 
-Example compile: (see README for more details)
-$ javac Llama2.java
-
-Then run with:
-$ java Llama2 stories15M.bin
-*/
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -22,11 +15,14 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.stream.IntStream;
 
 final class Config {
@@ -86,7 +82,7 @@ final class Weights {
     final FloatBuffer[] w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     final FloatBuffer rms_final_weight; // (dim,)
-    // freq_cis for RoPE relatively positional embeddings
+    // freq_cis for RoPE relatively positional embeddings (not used anymore)
     final FloatBuffer freq_cis_real; // (seq_len, head_size/2)
     final FloatBuffer freq_cis_imag; // (seq_len, head_size/2)
     // (optional) classifier weights for the logits, on the last layer
@@ -273,22 +269,21 @@ class Llama2 {
             matmul(s.k, s.xb, w.wk[l], dim, kv_dim);
             matmul(s.v, s.xb, w.wv[l], dim, kv_dim);
 
-            // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
-            for (int i = 0; i < dim; i += 2) {
-                float q0 = s.q[i];
-                float q1 = s.q[i+1];
-                float fcr = w.freq_cis_real.get(pos * head_size / 2 + (i % head_size) / 2);
-                float fci = w.freq_cis_imag.get(pos * head_size / 2 + (i % head_size) / 2);
-                s.q[i]   = q0 * fcr - q1 * fci;
-                s.q[i+1] = q0 * fci + q1 * fcr;
-            }
-            for (int i = 0; i < kv_dim; i += 2) {
-                float k0 = s.k[i];
-                float k1 = s.k[i+1];
-                float fcr = w.freq_cis_real.get(pos * head_size / 2 + (i % head_size) / 2);
-                float fci = w.freq_cis_imag.get(pos * head_size / 2 + (i % head_size) / 2);
-                s.k[i]   = k0 * fcr - k1 * fci;
-                s.k[i+1] = k0 * fci + k1 * fcr;
+            // RoPE relative positional encoding: complex-valued rotate q and k in each head
+            for (int i = 0; i < dim; i+=2) {
+                int head_dim = i % head_size;
+                float freq = (float) (1.0 / Math.pow(10000.0f, head_dim / (float) head_size));
+                float val = pos * freq;
+                float fcr = (float) Math.cos(val);
+                float fci = (float) Math.sin(val);
+                int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+                for (int v = 0; v < rotn; v++) {
+                    float[] vec = v == 0 ? s.q : s.k; // the vector to rotate (query or key)
+                    float v0 = vec[i];
+                    float v1 = vec[i + 1];
+                    vec[i] = v0 * fcr - v1 * fci;
+                    vec[i + 1] = v0 * fci + v1 * fcr;
+                }
             }
 
             // save key,value at this time step (pos) to our kv cache
@@ -388,29 +383,41 @@ class Llama2 {
 // ----------------------------------------------------------------------------
 // byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
 
-    static int str_lookup(String str, String[] vocab, int vocab_size) {
-        // find the first perfect match for str in vocab, return its index or -1 if not found
-        for (int i = 0; i < vocab_size; i++) {
-            if (str.equals(vocab[i])) {
-                return i;
-            }
-        }
-        return -1;
+    static int str_lookup(String str, SortedMap<String, Integer> sorted_vocab) {
+        // efficiently find the perfect match for str in vocab, return its index or -1 if not found
+        return sorted_vocab.getOrDefault(str, -1);
     }
 
     static int bpe_encode(String text, String[] vocab, float[] vocab_scores, int vocab_size, int[] tokens) {
-        // first encode every individual byte in the input string
-        int n_tokens = 0; // the number of tokens
-        for (int i = 0; i < text.length(); ++i) {
-            char c = text.charAt(i);
-            String singleChar = String.valueOf(c);
-            int id = str_lookup(singleChar, vocab, vocab_size);
-            if (id == -1) {
-                System.err.printf("not good\n");
-                System.exit(1);
+        // sort vocabulary
+        SortedMap<String, Integer> sorted_vocab = new TreeMap<>();
+        for (int i = 0; i < vocab_size; i++) {
+            assert !sorted_vocab.containsKey(vocab[i]);
+            sorted_vocab.put(vocab[i], i);
+        }
+
+        // add_dummy_prefix is true by default
+        tokens[0] = str_lookup(" ", sorted_vocab, vocab_size);
+        int n_tokens = 1; // the number of tokens
+
+        // first encode every individual codepoint in the input string
+        for (int i = 0, cpi; i < text.length(); i += Character.charCount(cpi)) {
+            cpi = text.codePointAt(i);
+
+            String singleCodepoint = Character.toString(cpi);
+            int id = str_lookup(singleCodepoint, sorted_vocab);
+
+            if (id != -1) {
+                // we found this codepoint in vocab, add it as a token
+                tokens[n_tokens++] = id;
+            } else {
+                // byte_fallback encoding: just encode each byte as a token
+                // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
+                // so the individual bytes only start at index 3
+                for (byte b : singleCodepoint.getBytes(StandardCharsets.UTF_8)) {
+                    tokens[n_tokens++] = Byte.toUnsignedInt(b) + 3;
+                }
             }
-            tokens[n_tokens] = id;
-            n_tokens++;
         }
 
         // merge the best consecutive pair each iteration, according the scores in vocab_scores
@@ -422,7 +429,7 @@ class Llama2 {
             for (int i = 0; i < n_tokens - 1; ++i) {
                 // check if we can merge the pair (tokens[i], tokens[i+1])
                 String str_buffer = vocab[tokens[i]] + vocab[tokens[i + 1]];
-                int id = str_lookup(str_buffer, vocab, vocab_size);
+                int id = str_lookup(str_buffer, sorted_vocab);
                 if (id != -1 && vocab_scores[id] > best_score) {
                     // this merge pair exists in vocab! record its score and position
                     best_score = vocab_scores[id];
@@ -653,7 +660,7 @@ class Llama2 {
                 int len = tokBuffer.getInt();
                 byte[] bytes = new byte[len];
                 tokBuffer.get(bytes);
-                vocab[i] = new String(bytes);
+                vocab[i] = new String(bytes, StandardCharsets.UTF_8);
             }
         }
 
@@ -674,7 +681,6 @@ class Llama2 {
         int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
         int pos = 0;     // position in the sequence
         while (pos < steps) {
-
             // forward the transformer to get logits for the next token
             transformer(token, pos, config, state, weights);
 
@@ -713,7 +719,22 @@ class Llama2 {
 
             // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR#89)
             String token_str = (token == 1 && vocab[next].charAt(0) == ' ') ? vocab[next].substring(1) : vocab[next];
-            System.out.print(token_str);
+
+            // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+            String prefix = "<0x";
+            String suffix = ">";
+            if (token_str.length() == 6 && token_str.startsWith(prefix) && token_str.endsWith(suffix)) {
+                String hex2 = token_str.substring(prefix.length(), prefix.length() + 2);
+                char ch = (char) Integer.parseInt(hex2, 16);
+                // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+                // some of the other bytes can be various control codes, backspace, etc. => skip
+                if (!Character.isISOControl(ch) || Character.isWhitespace(ch)) {
+                    System.out.print(ch);
+                }
+            } else {
+                System.out.print(token_str);
+            }
+
             System.out.flush();
             token = next;
 
