@@ -82,9 +82,6 @@ final class Weights {
     final FloatBuffer[] w3; // (layer, hidden_dim, dim)
     // final rmsnorm
     final FloatBuffer rms_final_weight; // (dim,)
-    // freq_cis for RoPE relatively positional embeddings (not used anymore)
-    final FloatBuffer freq_cis_real; // (seq_len, head_size/2)
-    final FloatBuffer freq_cis_imag; // (seq_len, head_size/2)
     // (optional) classifier weights for the logits, on the last layer
     final FloatBuffer wcls; // (vocab_size, dim)
 
@@ -123,8 +120,8 @@ final class Weights {
         this.w2 = takeArray(memorySegment, position, config.n_layers, config.dim, config.hidden_dim);
         this.w3 = takeArray(memorySegment, position, config.n_layers, config.hidden_dim, config.dim);
         this.rms_final_weight = takeFloats(memorySegment, position, config.dim);
-        this.freq_cis_real = takeFloats(memorySegment, position, config.seq_len, config.head_size / 2);
-        this.freq_cis_imag = takeFloats(memorySegment, position, config.seq_len, config.head_size / 2);
+        position[0] += config.seq_len * config.head_size / 2; // skip what used to be freq_cis_real (for RoPE)
+        position[0] += config.seq_len * config.head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
         this.wcls = config.shared_weights
                 ? this.token_embedding_table
                 : takeFloats(memorySegment, position, config.vocab_size, config.dim);
@@ -381,23 +378,82 @@ class Llama2 {
     }
 
 // ----------------------------------------------------------------------------
-// byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
+
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+
+    static final class Tokenizer {
+        String[] vocab;
+        float[] vocab_scores;
+        int vocab_size;
+        int max_token_length;
+        byte[] byte_piece; // Java char is two bytes
+
+        Tokenizer(String tokenizer, int vocab_size) throws IOException {
+            // i should have written the vocab_size into the tokenizer file... sigh
+            this.vocab_size = vocab_size;
+            // malloc space to hold the scores and the strings
+            this.vocab = new String[vocab_size];
+            this.vocab_scores = new float[vocab_size];
+            this.byte_piece = new byte[2];
+            this.byte_piece[1] = '\0'; // null terminate the byte_piece string
+
+            // read in the file
+            try (FileChannel channel = FileChannel.open(Paths.get(tokenizer), StandardOpenOption.READ)) {
+                ByteBuffer tokBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+                tokBuffer.order(ByteOrder.LITTLE_ENDIAN);
+                int max_token_length = tokBuffer.getInt();
+                for (int i = 0; i < vocab_size; i++) {
+                    this.vocab_scores[i] = tokBuffer.getFloat();
+                    int len = tokBuffer.getInt();
+                    byte[] bytes = new byte[len];
+                    tokBuffer.get(bytes);
+                    this.vocab[i] = new String(bytes, StandardCharsets.UTF_8);
+                }
+            }
+        }
+    }
+
+    static String get_piece(Tokenizer t, int prev_token, int token) {
+        String piece = t.vocab[token];
+        // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
+        if (prev_token == 1 && piece.charAt(0) == ' ') { piece = piece.substring(1); }
+        // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
+        byte byte_val;
+
+        String prefix = "<0x";
+        String suffix = ">";
+        if (piece.length() == 6 && piece.startsWith(prefix) && piece.endsWith(suffix)) {
+            String hex2 = piece.substring(prefix.length(), prefix.length() + 2);
+            char ch = (char) Integer.parseInt(hex2, 16);
+            // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
+            // some of the other bytes can be various control codes, backspace, etc. => skip
+            boolean isPrintable = (32 <= ch && ch < 127);
+            if (isPrintable || Character.isWhitespace(ch)) {
+                piece = Character.toString(ch);
+            }
+        }
+        return piece;
+    }
 
     static int str_lookup(String str, SortedMap<String, Integer> sorted_vocab) {
         // efficiently find the perfect match for str in vocab, return its index or -1 if not found
         return sorted_vocab.getOrDefault(str, -1);
     }
 
-    static int bpe_encode(String text, String[] vocab, float[] vocab_scores, int vocab_size, int[] tokens) {
+
+
+    static int bpe_encode(Tokenizer t, String text, int[] tokens) {
+        // encode the string text (input) into an upper-bound preallocated tokens[] array
+
         // sort vocabulary
         SortedMap<String, Integer> sorted_vocab = new TreeMap<>();
-        for (int i = 0; i < vocab_size; i++) {
-            assert !sorted_vocab.containsKey(vocab[i]);
-            sorted_vocab.put(vocab[i], i);
+        for (int i = 0; i < t.vocab_size; i++) {
+            assert !sorted_vocab.containsKey(t.vocab[i]);
+            sorted_vocab.put(t.vocab[i], i);
         }
 
         // add_dummy_prefix is true by default
-        tokens[0] = str_lookup(" ", sorted_vocab, vocab_size);
+        tokens[0] = str_lookup(" ", sorted_vocab);
         int n_tokens = 1; // the number of tokens
 
         // first encode every individual codepoint in the input string
@@ -428,11 +484,11 @@ class Llama2 {
 
             for (int i = 0; i < n_tokens - 1; ++i) {
                 // check if we can merge the pair (tokens[i], tokens[i+1])
-                String str_buffer = vocab[tokens[i]] + vocab[tokens[i + 1]];
+                String str_buffer = t.vocab[tokens[i]] + t.vocab[tokens[i + 1]];
                 int id = str_lookup(str_buffer, sorted_vocab);
-                if (id != -1 && vocab_scores[id] > best_score) {
+                if (id != -1 && t.vocab_scores[id] > best_score) {
                     // this merge pair exists in vocab! record its score and position
-                    best_score = vocab_scores[id];
+                    best_score = t.vocab_scores[id];
                     best_id = id;
                     best_idx = i;
                 }
@@ -598,8 +654,8 @@ class Llama2 {
     public static void main(String[] args) throws IOException {
 
         // default inits
-        String checkpoint = null; // e.g. out/model.bin
-        String tokenizer = "tokenizer.bin";
+        String checkpoint_path = null; // e.g. out/model.bin
+        String tokenizer_path = "tokenizer.bin";
         float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
         float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
         rng_seed = 0;             // seed rng with time by default
@@ -608,7 +664,7 @@ class Llama2 {
 
         // poor man's C argparse so we can override the defaults above from the command line
         if (args.length >= 1) {
-            checkpoint = args[0];
+            checkpoint_path = args[0];
         } else {
             error_usage();
         }
@@ -624,7 +680,7 @@ class Llama2 {
                 case 's' -> rng_seed = Integer.parseInt(args[i + 1]);
                 case 'n' -> steps = Integer.parseInt(args[i + 1]);
                 case 'i' -> prompt = args[i + 1];
-                case 'z' -> tokenizer = args[i + 1];
+                case 'z' -> tokenizer_path = args[i + 1];
                 default -> error_usage();
             }
         }
@@ -633,7 +689,7 @@ class Llama2 {
             rng_seed =  System.currentTimeMillis();
         }
 
-        FileChannel fileChannel = FileChannel.open(Paths.get(checkpoint), StandardOpenOption.READ);
+        FileChannel fileChannel = FileChannel.open(Paths.get(checkpoint_path), StandardOpenOption.READ);
         long size = fileChannel.size();
         MemorySegment mappedFile = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, size, SegmentScope.global());
         int configSize = 7 * Integer.BYTES;
@@ -648,21 +704,7 @@ class Llama2 {
             steps = config.seq_len;
         }
 
-        // read in the tokenizer .bin file
-        String[] vocab = new String[config.vocab_size];
-        float[] vocab_scores = new float[config.vocab_size];
-        try (FileChannel channel = FileChannel.open(Paths.get(tokenizer), StandardOpenOption.READ)) {
-            ByteBuffer tokBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
-            tokBuffer.order(ByteOrder.LITTLE_ENDIAN);
-            int max_token_length = tokBuffer.getInt();
-            for (int i = 0; i < config.vocab_size; i++) {
-                vocab_scores[i] = tokBuffer.getFloat();
-                int len = tokBuffer.getInt();
-                byte[] bytes = new byte[len];
-                tokBuffer.get(bytes);
-                vocab[i] = new String(bytes, StandardCharsets.UTF_8);
-            }
-        }
+        Tokenizer tokenizer = new Tokenizer(tokenizer_path, config.vocab_size);
 
         // create and init the application RunState
         RunState state = new RunState(config);
@@ -672,7 +714,7 @@ class Llama2 {
         int num_prompt_tokens = 0;
         if (prompt != null) {
             prompt_tokens = new int[config.seq_len];
-            num_prompt_tokens = bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, prompt_tokens);
+            num_prompt_tokens = bpe_encode(tokenizer, prompt, prompt_tokens);
         }
 
         // start the main loop
@@ -717,23 +759,9 @@ class Llama2 {
                 break;
             }
 
-            // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR#89)
-            String token_str = (token == 1 && vocab[next].charAt(0) == ' ') ? vocab[next].substring(1) : vocab[next];
-
-            // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-            String prefix = "<0x";
-            String suffix = ">";
-            if (token_str.length() == 6 && token_str.startsWith(prefix) && token_str.endsWith(suffix)) {
-                String hex2 = token_str.substring(prefix.length(), prefix.length() + 2);
-                char ch = (char) Integer.parseInt(hex2, 16);
-                // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
-                // some of the other bytes can be various control codes, backspace, etc. => skip
-                if (!Character.isISOControl(ch) || Character.isWhitespace(ch)) {
-                    System.out.print(ch);
-                }
-            } else {
-                System.out.print(token_str);
-            }
+            // print the token as string, decode it with the Tokenizer object
+            String piece = get_piece(tokenizer, token, next);
+            System.out.print(piece);
 
             System.out.flush();
             token = next;
