@@ -1,3 +1,8 @@
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 20
+//COMPILE_OPTIONS --enable-preview -source 20 --add-modules=jdk.incubator.vector
+//RUNTIME_OPTIONS --enable-preview --add-modules=jdk.incubator.vector
+
 /* Inference for Llama-2 Transformer model in pure Java */
 
 // ----------------------------------------------------------------------------
