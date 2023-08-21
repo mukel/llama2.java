@@ -6,7 +6,7 @@
 /* Inference for Llama-2 Transformer model in pure Java */
 
 // ----------------------------------------------------------------------------
-// Transformer and RunState structs, and related memory management
+// Transformer model
 
 import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.VectorOperators;
@@ -15,13 +15,11 @@ import jdk.incubator.vector.VectorSpecies;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SegmentScope;
-import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
@@ -125,8 +123,8 @@ final class Weights {
         this.w2 = takeArray(memorySegment, position, config.n_layers, config.dim, config.hidden_dim);
         this.w3 = takeArray(memorySegment, position, config.n_layers, config.hidden_dim, config.dim);
         this.rms_final_weight = takeFloats(memorySegment, position, config.dim);
-        position[0] += config.seq_len * config.head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-        position[0] += config.seq_len * config.head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+        position[0] += (config.seq_len * config.head_size / 2) * Float.BYTES; // skip what used to be freq_cis_real (for RoPE)
+        position[0] += (config.seq_len * config.head_size / 2) * Float.BYTES; // skip what used to be freq_cis_imag (for RoPE)
         this.wcls = config.shared_weights
                 ? this.token_embedding_table
                 : takeFloats(memorySegment, position, config.vocab_size, config.dim);
@@ -148,7 +146,6 @@ final class RunState {
     // kv cache
     final float[] key_cache;   // (layer, seq_len, dim)
     final float[] value_cache; // (layer, seq_len, dim)
-    final int[] indices; // (vocab_size)
 
     RunState(Config config) {
         int kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
@@ -164,14 +161,79 @@ final class RunState {
         this.logits = new float[config.vocab_size];
         this.key_cache = new float[config.n_layers * config.seq_len * kv_dim];
         this.value_cache = new float[config.n_layers * config.seq_len * kv_dim];
-        this.indices = IntStream.range(0, config.vocab_size).toArray();
+    }
+}
+
+final class Transformer {
+    final Config config; // the hyperparameters of the architecture (the blueprint)
+    final Weights weights; // the weights of the model
+    final RunState state; // buffers for the "wave" of activations in the forward pass
+    // some more state needed to properly clean up the memory mapping (sigh)
+    final SegmentScope memoryScope; // scope of the memory mapping
+    final MemorySegment data; // memory mapped data pointer
+    final long file_size; // size of the checkpoint file in bytes
+
+    Transformer(String checkpoint_path) throws IOException {
+        try (FileChannel fileChannel = FileChannel.open(Paths.get(checkpoint_path), StandardOpenOption.READ)) {
+            this.file_size = fileChannel.size();
+            this.memoryScope = SegmentScope.auto();
+            MemorySegment mappedFile = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, this.file_size, this.memoryScope);
+            this.data = mappedFile;
+            int configSize = 7 * Integer.BYTES;
+            // read in the config header
+            ByteBuffer configBuffer = mappedFile.asSlice(0, configSize).asByteBuffer().order(ByteOrder.LITTLE_ENDIAN);
+            this.config = new Config(configBuffer);
+            System.out.println(config);
+            this.state = new RunState(config);
+            this.weights = new Weights(config, mappedFile.asSlice(configSize));
+        }
+    }
+}
+
+final class Tokenizer {
+    final String[] vocab;
+    final float[] vocab_scores;
+    final int vocab_size;
+    final int max_token_length;
+
+    Tokenizer(String tokenizer_path, int vocab_size) throws IOException {
+        // i should have written the vocab_size into the tokenizer file... sigh
+        this.vocab_size = vocab_size;
+        // malloc space to hold the scores and the strings
+        this.vocab = new String[vocab_size];
+        this.vocab_scores = new float[vocab_size];
+
+        // read in the file
+        try (FileChannel channel = FileChannel.open(Paths.get(tokenizer_path), StandardOpenOption.READ)) {
+            ByteBuffer tokBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+            tokBuffer.order(ByteOrder.LITTLE_ENDIAN);
+            this.max_token_length = tokBuffer.getInt();
+            for (int i = 0; i < vocab_size; i++) {
+                this.vocab_scores[i] = tokBuffer.getFloat();
+                int len = tokBuffer.getInt();
+                byte[] bytes = new byte[len];
+                tokBuffer.get(bytes);
+                this.vocab[i] = new String(bytes, StandardCharsets.UTF_8);
+            }
+        }
+    }
+}
+
+final class Sampler {
+    final int vocab_size;
+    final int[] probindex; // buffer used in top-p sampling
+
+    Sampler(int vocab_size) {
+        this.vocab_size = vocab_size;
+        // probindex might not be needed, but it's a ~small buffer so we'll just malloc it
+        this.probindex = new int[vocab_size];
     }
 }
 
 class Llama2 {
 
 // ----------------------------------------------------------------------------
-// neural net blocks
+// neural net blocks; the dynamics of the Transformer
 
     static void rmsnorm(float[] o, float[] x, FloatBuffer weight, int size) {
         // calculate sum of squares
@@ -248,9 +310,11 @@ class Llama2 {
         });
     }
 
-    static void transformer(int token, int pos, Config p, RunState s, Weights w) {
-
+    static float[] forward(Transformer transformer, int token, int pos) {
         // a few convenience variables
+        Config p = transformer.config;
+        Weights w = transformer.weights;
+        RunState s = transformer.state;
         int dim = p.dim;
         int hidden_dim = p.hidden_dim;
         int head_size = p.head_size;
@@ -380,45 +444,14 @@ class Llama2 {
 
         // classifier into logits
         matmul(s.logits, s.x, w.wcls, dim, p.vocab_size);
+        return s.logits;
     }
 
 // ----------------------------------------------------------------------------
 
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
-    static final class Tokenizer {
-        String[] vocab;
-        float[] vocab_scores;
-        int vocab_size;
-        int max_token_length;
-        byte[] byte_piece; // Java char is two bytes
-
-        Tokenizer(String tokenizer, int vocab_size) throws IOException {
-            // i should have written the vocab_size into the tokenizer file... sigh
-            this.vocab_size = vocab_size;
-            // malloc space to hold the scores and the strings
-            this.vocab = new String[vocab_size];
-            this.vocab_scores = new float[vocab_size];
-            this.byte_piece = new byte[2];
-            this.byte_piece[1] = '\0'; // null terminate the byte_piece string
-
-            // read in the file
-            try (FileChannel channel = FileChannel.open(Paths.get(tokenizer), StandardOpenOption.READ)) {
-                ByteBuffer tokBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
-                tokBuffer.order(ByteOrder.LITTLE_ENDIAN);
-                int max_token_length = tokBuffer.getInt();
-                for (int i = 0; i < vocab_size; i++) {
-                    this.vocab_scores[i] = tokBuffer.getFloat();
-                    int len = tokBuffer.getInt();
-                    byte[] bytes = new byte[len];
-                    tokBuffer.get(bytes);
-                    this.vocab[i] = new String(bytes, StandardCharsets.UTF_8);
-                }
-            }
-        }
-    }
-
-    static String get_piece(Tokenizer t, int prev_token, int token) {
+    static String decode(Tokenizer t, int prev_token, int token) {
         String piece = t.vocab[token];
         // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
         if (prev_token == 1 && piece.charAt(0) == ' ') { piece = piece.substring(1); }
@@ -445,9 +478,7 @@ class Llama2 {
         return sorted_vocab.getOrDefault(str, -1);
     }
 
-
-
-    static int bpe_encode(Tokenizer t, String text, int[] tokens) {
+    static int encode(Tokenizer t, String text, int[] tokens) {
         // encode the string text (input) into an upper-bound preallocated tokens[] array
 
         // sort vocabulary
@@ -540,7 +571,7 @@ class Llama2 {
 // ----------------------------------------------------------------------------
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
-    static int argmax(float[] probabilities, int n) {
+    static int sample_argmax(float[] probabilities, int n) {
         // return the index that has the highest probability
         int max_i = 0;
         float max_p = probabilities[0];
@@ -553,7 +584,7 @@ class Llama2 {
         return max_i;
     }
 
-    static int sample(float[] probabilities, int n) {
+    static int sample_mult(float[] probabilities, int n) {
         // sample index from probabilities (they must sum to 1!)
         float r = random_f32();
         float cdf = 0.0f;
@@ -640,6 +671,33 @@ class Llama2 {
         return indices[last_idx]; // in case of rounding errors
     }
 
+    static int sample(Sampler sampler, float[] logits, float temperature, float topp) {
+        // sample the token given the logits and some hyperparameters
+        int next;
+        if (temperature == 0.0f) {
+            // greedy argmax sampling: take the token with the highest probability
+            next = sample_argmax(logits, sampler.vocab_size);
+        } else {
+            // apply the temperature to the logits
+            for (int q = 0; q < sampler.vocab_size; q++) {
+                logits[q] /= temperature;
+            }
+            // apply softmax to the logits to get the probabilities for next token
+            softmax(logits, 0, sampler.vocab_size);
+            // we sample from this distribution to get the next token
+            if (topp <= 0 || topp >= 1) {
+                // simply sample from the predicted probability distribution
+                next = sample_mult(logits, sampler.vocab_size);
+            } else {
+                // top-p (nucleus) sampling, clamping the least likely tokens to zero
+                next = sample_topp(logits, sampler.vocab_size, topp, sampler.probindex);
+            }
+        }
+        return next;
+    }
+
+
+
 // ----------------------------------------------------------------------------
 // int main
 
@@ -647,18 +705,17 @@ class Llama2 {
         System.err.println("Usage:   java Llama2 <checkpoint> [options]");
         System.err.println("Example: java Lamma2 model.bin -n 256 -i \"Once upon a time\"");
         System.err.println("Options:");
-        System.err.println("  -t <float>  temperature, default 1.0");
-        System.err.println("  -p <float>  p value in top-p (nucleus) sampling. default 0.9");
+        System.err.println("  -t <float>  temperature in [0,inf], default 1.0");
+        System.err.println("  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9");
         System.err.println("  -s <int>    random seed, default time(NULL)");
         System.err.println("  -n <int>    number of steps to run for, default 256. 0 = max_seq_len");
-        System.err.println("  -i <string> input prompt\n");
+        System.err.println("  -i <string> input prompt");
         System.err.println("  -z <string> optional path to custom tokenizer");
         System.exit(1);
     }
 
     public static void main(String[] args) throws IOException {
-
-        // default inits
+        // default parameters
         String checkpoint_path = null; // e.g. out/model.bin
         String tokenizer_path = "tokenizer.bin";
         float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
@@ -690,36 +747,36 @@ class Llama2 {
             }
         }
 
-        if (rng_seed == 0) {
-            rng_seed =  System.currentTimeMillis();
+        // parameter validation/overrides
+        if (rng_seed <= 0) {
+            rng_seed = System.currentTimeMillis();
+        }
+        if (temperature < 0.0) {
+            temperature = 0.0f;
+        }
+        if (topp < 0.0 || 1.0 < topp) {
+            topp = 0.9f;
+        }
+        if (steps <= 0) {
+            steps = 0;
         }
 
-        FileChannel fileChannel = FileChannel.open(Paths.get(checkpoint_path), StandardOpenOption.READ);
-        long size = fileChannel.size();
-        MemorySegment mappedFile = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, size, SegmentScope.global());
-        int configSize = 7 * Integer.BYTES;
-        // read in the config header
-        ByteBuffer configBuffer = mappedFile.asSlice(0, configSize).asByteBuffer().order(ByteOrder.LITTLE_ENDIAN);
-        Config config = new Config(configBuffer);
-        System.err.println(config);
-        Weights weights = new Weights(config, mappedFile.asSlice(configSize));
+        // build the Transformer via the model .bin file
+        Transformer transformer = new Transformer(checkpoint_path);
+        // convenience copy
 
-        // right now we cannot run for more than config.seq_len steps
-        if (steps <= 0 || steps > config.seq_len) {
-            steps = config.seq_len;
-        }
+        // build the Tokenizer via the tokenizer .bin file
+        Tokenizer tokenizer = new Tokenizer(tokenizer_path, transformer.config.vocab_size);
 
-        Tokenizer tokenizer = new Tokenizer(tokenizer_path, config.vocab_size);
+        // build the Sampler
+        Sampler sampler = new Sampler(transformer.config.vocab_size);
 
-        // create and init the application RunState
-        RunState state = new RunState(config);
-
-        // process the prompt, if any
-        int[] prompt_tokens = null;
-        int num_prompt_tokens = 0;
+        // encode the (string) prompt into tokens sequence, if any is given
+        int[] prompt_tokens = null; // the sequence of prompt tokens
+        int num_prompt_tokens = 0; // the total number of prompt tokens
         if (prompt != null) {
-            prompt_tokens = new int[config.seq_len];
-            num_prompt_tokens = bpe_encode(tokenizer, prompt, prompt_tokens);
+            prompt_tokens = new int[prompt.length() * 2];
+            num_prompt_tokens = encode(tokenizer, prompt, prompt_tokens);
         }
 
         // start the main loop
@@ -729,33 +786,15 @@ class Llama2 {
         int pos = 0;     // position in the sequence
         while (pos < steps) {
             // forward the transformer to get logits for the next token
-            transformer(token, pos, config, state, weights);
+            float[] logits = forward(transformer, token, pos);
 
-            // advance the state state machine
+            // advance the state machine
             if (pos < num_prompt_tokens) {
                 // if we are still processing the input prompt, force the next prompt token
                 next = prompt_tokens[pos];
             } else {
-                // sample the next token
-                if (temperature == 0.0f) {
-                    // greedy argmax sampling: take the token with the highest probability
-                    next = argmax(state.logits, config.vocab_size);
-                } else {
-                    // apply the temperature to the logits
-                    for (int q = 0; q < config.vocab_size; q++) {
-                        state.logits[q] /= temperature;
-                    }
-                    // apply softmax to the logits to get the probabilities for next token
-                    softmax(state.logits, 0, config.vocab_size);
-                    // we sample from this distribution to get the next token
-                    if (topp <= 0 || topp >= 1) {
-                        // simply sample from the predicted probability distribution
-                        next = sample(state.logits, config.vocab_size);
-                    } else {
-                        // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                        next = sample_topp(state.logits, config.vocab_size, topp, state.indices);
-                    }
-                }
+                // otherwise sample the next token from the logits
+                next = sample(sampler, logits, temperature, topp);
             }
             pos++;
 
@@ -765,7 +804,7 @@ class Llama2 {
             }
 
             // print the token as string, decode it with the Tokenizer object
-            String piece = get_piece(tokenizer, token, next);
+            String piece = decode(tokenizer, token, next);
             System.out.print(piece);
 
             System.out.flush();
