@@ -21,7 +21,14 @@ javac --enable-preview -source 20 --add-modules=jdk.incubator.vector Llama2.java
 java --enable-preview --add-modules=jdk.incubator.vector Llama2 stories15M.bin
 ```
 
-For convenience, a `Makefile` and a `run.sh` script are also provided:
+Or run it directly with [JBang](https://www.jbang.dev/):
+```bash
+jbang Llama2.java stories15M.bin
+# With additional -D options and custom Java home.
+JAVA_HOME=/path/to/java/home jbang -Djava.util.concurrent.ForkJoinPool.common.parallelism=0 -Dllama2.VectorAPI=false Llama2.java stories15M.bin
+```
+
+A `Makefile` and a `run.sh` script are also provided:
 
 ```bash
 make # optional, run.sh already runs make
@@ -42,7 +49,7 @@ JAVA_HOME=$GRAALVM_HOME NATIVE_IMAGE_OPTIONS="-march=native" make native-image
 Or can also be built with [Profile-Guided Optimizations (PGO)](https://www.graalvm.org/dev/reference-manual/native-image/guides/optimize-native-executable-with-pgo), on Oracle GaaalVM:
 ```bash
 JAVA_HOME=$GRAALVM_HOME \
-NATIVE_IMAGE_OPTIONS="--pgo-instrument -march=native" \
+NATIVE_IMAGE_OPTIONS="--pgo-instrument -march=native --initialize-at-build-time=Llama2 -Dllama2.VectorAPI=false" \
 make native-image
 
 # Profile run to generate default.iprof, with no parallelism to speedup profiling.
@@ -50,9 +57,10 @@ make native-image
 
 # Build optimized image
 JAVA_HOME=$GRAALVM_HOME \
-NATIVE_IMAGE_OPTIONS="--pgo -march=native" \
+NATIVE_IMAGE_OPTIONS="--pgo -march=native --initialize-at-build-time=Llama2 -Dllama2.VectorAPI=false" \
 make native-image
 
+# Should run ~2X faster than regular image.
 ./llama2 stories15M.bin
 ```
 
