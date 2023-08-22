@@ -776,7 +776,9 @@ class Llama2 {
 
         // build the Transformer via the model .bin file
         Transformer transformer = new Transformer(checkpoint_path);
-        // convenience copy
+        if (steps == 0) {
+            steps = transformer.config.seq_len; // ovrerride to ~max length
+        }
 
         // build the Tokenizer via the tokenizer .bin file
         Tokenizer tokenizer = new Tokenizer(tokenizer_path, transformer.config.vocab_size);
