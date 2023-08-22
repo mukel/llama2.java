@@ -25,8 +25,9 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.SortedMap;
-import java.util.TreeMap;
 import java.util.stream.IntStream;
 
 final class Config {
@@ -196,6 +197,7 @@ final class Tokenizer {
     final float[] vocab_scores;
     final int vocab_size;
     final int max_token_length;
+    Map<String, Integer> sorted_vocab;
 
     Tokenizer(String tokenizer_path, int vocab_size) throws IOException {
         // i should have written the vocab_size into the tokenizer file... sigh
@@ -223,11 +225,29 @@ final class Tokenizer {
 final class Sampler {
     final int vocab_size;
     final int[] probindex; // buffer used in top-p sampling
+    final float temperature;
+    final float topp;
+    long rng_seed;
 
-    Sampler(int vocab_size) {
+    Sampler(int vocab_size, float temperature, float topp, long rng_seed) {
         this.vocab_size = vocab_size;
-        // probindex might not be needed, but it's a ~small buffer so we'll just malloc it
+        this.temperature = temperature;
+        this.topp = topp;
+        this.rng_seed = rng_seed;
+        // buffer only used with nucleus sampling; may not need but it's ~small
         this.probindex = new int[vocab_size];
+    }
+
+    int random_u32() {
+        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+        rng_seed ^= rng_seed >> 12;
+        rng_seed ^= rng_seed << 25;
+        rng_seed ^= rng_seed >> 27;
+        return (int) ((rng_seed * 0x2545F4914F6CDD1DL) >> 32);
+    }
+
+    float random_f32() { // random float32 in [0,1)
+        return (random_u32() >>> 8) / 16777216.0f;
     }
 }
 
@@ -433,9 +453,13 @@ class Llama2 {
             matmul(s.hb, s.xb, w.w1[l], dim, p.hidden_dim);
             matmul(s.hb2, s.xb, w.w3[l], dim, p.hidden_dim);
 
-            // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
+            // SwiGLU non-linearity
             for (int i = 0; i < hidden_dim; i++) {
-                s.hb[i] = s.hb[i] / (1.0f + (float) Math.exp(-s.hb[i]));
+                float val = s.hb[i];
+                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+                val *= (1.0f / (1.0f + Math.exp(-val)));
+                // elementwise multiply with w3(x)
+                s.hb[i] = val;
             }
 
             // elementwise multiply with w3(x)
@@ -486,7 +510,7 @@ class Llama2 {
         return piece;
     }
 
-    static int str_lookup(String str, SortedMap<String, Integer> sorted_vocab) {
+    static int str_lookup(String str, Map<String, Integer> sorted_vocab) {
         // efficiently find the perfect match for str in vocab, return its index or -1 if not found
         return sorted_vocab.getOrDefault(str, -1);
     }
@@ -494,15 +518,17 @@ class Llama2 {
     static int encode(Tokenizer t, String text, int[] tokens) {
         // encode the string text (input) into an upper-bound preallocated tokens[] array
 
-        // sort vocabulary
-        SortedMap<String, Integer> sorted_vocab = new TreeMap<>();
-        for (int i = 0; i < t.vocab_size; i++) {
-            assert !sorted_vocab.containsKey(t.vocab[i]);
-            sorted_vocab.put(t.vocab[i], i);
+        if (t.sorted_vocab == null) {
+            // sort vocabulary
+            t.sorted_vocab = new HashMap<>();
+            for (int i = 0; i < t.vocab_size; i++) {
+                assert !t.sorted_vocab.containsKey(t.vocab[i]);
+                t.sorted_vocab.put(t.vocab[i], i);
+            }
         }
 
         // add_dummy_prefix is true by default
-        tokens[0] = str_lookup(" ", sorted_vocab);
+        tokens[0] = str_lookup(" ", t.sorted_vocab);
         int n_tokens = 1; // the number of tokens
 
         // first encode every individual codepoint in the input string
@@ -510,7 +536,7 @@ class Llama2 {
             cpi = text.codePointAt(i);
 
             String singleCodepoint = Character.toString(cpi);
-            int id = str_lookup(singleCodepoint, sorted_vocab);
+            int id = str_lookup(singleCodepoint, t.sorted_vocab);
 
             if (id != -1) {
                 // we found this codepoint in vocab, add it as a token
@@ -534,7 +560,7 @@ class Llama2 {
             for (int i = 0; i < n_tokens - 1; ++i) {
                 // check if we can merge the pair (tokens[i], tokens[i+1])
                 String str_buffer = t.vocab[tokens[i]] + t.vocab[tokens[i + 1]];
-                int id = str_lookup(str_buffer, sorted_vocab);
+                int id = str_lookup(str_buffer, t.sorted_vocab);
                 if (id != -1 && t.vocab_scores[id] > best_score) {
                     // this merge pair exists in vocab! record its score and position
                     best_score = t.vocab_scores[id];
@@ -567,19 +593,65 @@ class Llama2 {
         return System.nanoTime() / 1_000_000;
     }
 
-    static long rng_seed;
 
-    static int random_u32() {
-        // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-        rng_seed ^= rng_seed >> 12;
-        rng_seed ^= rng_seed << 25;
-        rng_seed ^= rng_seed >> 27;
-        return (int) ((rng_seed * 0x2545F4914F6CDD1DL) >> 32);
+// ----------------------------------------------------------------------------
+// generation loop
+
+    static void generate(Transformer transformer, Tokenizer tokenizer, Sampler sampler, String prompt, int steps) {
+        // encode the (string) prompt into tokens sequence, if any is given
+        int[] prompt_tokens = null; // the sequence of prompt tokens
+        int num_prompt_tokens = 0; // the total number of prompt tokens
+        if (prompt != null) {
+            prompt_tokens = new int[prompt.length() * 2];
+            num_prompt_tokens = encode(tokenizer, prompt, prompt_tokens);
+        }
+
+        // start the main loop
+        long start = 0;  // used to time our code, only initialized after first iteration
+        int next;        // will store the next token in the sequence
+        int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+        int pos = 0;     // position in the sequence
+        while (pos < steps) {
+            // forward the transformer to get logits for the next token
+            float[] logits = forward(transformer, token, pos);
+
+            // advance the state machine
+            if (pos < num_prompt_tokens) {
+                // if we are still processing the input prompt, force the next prompt token
+                next = prompt_tokens[pos];
+            } else {
+                // otherwise sample the next token from the logits
+                next = sample(sampler, logits);
+            }
+            pos++;
+
+            // data-dependent terminating condition: the BOS (1) token delimits sequences
+            if (next == 1) {
+                break;
+            }
+
+            // print the token as string, decode it with the Tokenizer object
+            String piece = decode(tokenizer, token, next);
+            System.out.print(piece);
+
+            System.out.flush();
+            token = next;
+
+            // init the timer here because the first iteration can be slower
+            if (start == 0) {
+                start = time_in_ms();
+            }
+        }
+
+        System.out.println();
+
+        // report achieved tok/s (pos-1 because the timer starts after first iteration)
+        if (pos > 1) {
+            long end = time_in_ms();
+            System.err.printf("\nachieved tok/s: %f\n", (pos - 1) / (double) (end - start) * 1000);
+        }
     }
 
-    static float random_f32() { // random float32 in [0,1)
-        return (random_u32() >>> 8) / 16777216.0f;
-    }
 
 // ----------------------------------------------------------------------------
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
@@ -597,13 +669,12 @@ class Llama2 {
         return max_i;
     }
 
-    static int sample_mult(float[] probabilities, int n) {
+    static int sample_mult(float[] probabilities, int n, float coin) {
         // sample index from probabilities (they must sum to 1!)
-        float r = random_f32();
         float cdf = 0.0f;
         for (int i = 0; i < n; i++) {
             cdf += probabilities[i];
-            if (r < cdf) {
+            if (coin < cdf) {
                 return i;
             }
         }
@@ -632,10 +703,11 @@ class Llama2 {
         }
     }
 
-    static int sample_topp(float[] probabilities, int n, float topp, int[] indices) {
+    static int sample_topp(float[] probabilities, int n, float topp, int[] indices, float coin) {
         // top-p sampling (or "nucleus sampling") samples from the smallest set of
         // tokens that exceed probability topp. This way we never sample tokens that
         // have very low probabilities and are less likely to go "off the rails".
+        // coin is a random number in [0, 1), usually from random_f32()
         Comparator<Integer> comparator = Comparator.<Integer>comparingDouble(i -> probabilities[i]).reversed();
 
         int head = 0;
@@ -672,7 +744,7 @@ class Llama2 {
         }
 
         // sample from the truncated list
-        float r = random_f32() * cumulative_prob;
+        float r = coin * cumulative_prob;
         float cdf = 0.0f;
         for (int i = n0 - 1; i >= last_idx; i--) {
             cdf += probabilities[indices[i]];
@@ -684,26 +756,28 @@ class Llama2 {
         return indices[last_idx]; // in case of rounding errors
     }
 
-    static int sample(Sampler sampler, float[] logits, float temperature, float topp) {
+    static int sample(Sampler sampler, float[] logits) {
         // sample the token given the logits and some hyperparameters
         int next;
-        if (temperature == 0.0f) {
+        if (sampler.temperature == 0.0f) {
             // greedy argmax sampling: take the token with the highest probability
             next = sample_argmax(logits, sampler.vocab_size);
         } else {
             // apply the temperature to the logits
             for (int q = 0; q < sampler.vocab_size; q++) {
-                logits[q] /= temperature;
+                logits[q] /= sampler.temperature;
             }
             // apply softmax to the logits to get the probabilities for next token
             softmax(logits, 0, sampler.vocab_size);
+            // flip a (float) coin (this is our source of entropy for sampling)
+            float coin = sampler.random_f32();
             // we sample from this distribution to get the next token
-            if (topp <= 0 || topp >= 1) {
+            if (sampler.topp <= 0 || sampler.topp >= 1) {
                 // simply sample from the predicted probability distribution
-                next = sample_mult(logits, sampler.vocab_size);
+                next = sample_mult(logits, sampler.vocab_size, coin);
             } else {
                 // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                next = sample_topp(logits, sampler.vocab_size, topp, sampler.probindex);
+                next = sample_topp(logits, sampler.vocab_size, sampler.topp, sampler.probindex, coin);
             }
         }
         return next;
@@ -733,7 +807,7 @@ class Llama2 {
         String tokenizer_path = "tokenizer.bin";
         float temperature = 1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
         float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-        rng_seed = 0;             // seed rng with time by default
+        long rng_seed = 0;        // seed rng with time by default
         int steps = 256;          // max number of steps to run for, 0: use seq_len
         String prompt = null;     // prompt string
 
@@ -784,59 +858,9 @@ class Llama2 {
         Tokenizer tokenizer = new Tokenizer(tokenizer_path, transformer.config.vocab_size);
 
         // build the Sampler
-        Sampler sampler = new Sampler(transformer.config.vocab_size);
+        Sampler sampler = new Sampler(transformer.config.vocab_size, temperature, topp, rng_seed);
 
-        // encode the (string) prompt into tokens sequence, if any is given
-        int[] prompt_tokens = null; // the sequence of prompt tokens
-        int num_prompt_tokens = 0; // the total number of prompt tokens
-        if (prompt != null) {
-            prompt_tokens = new int[prompt.length() * 2];
-            num_prompt_tokens = encode(tokenizer, prompt, prompt_tokens);
-        }
-
-        // start the main loop
-        long start = 0;  // used to time our code, only initialized after first iteration
-        int next;        // will store the next token in the sequence
-        int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
-        int pos = 0;     // position in the sequence
-        while (pos < steps) {
-            // forward the transformer to get logits for the next token
-            float[] logits = forward(transformer, token, pos);
-
-            // advance the state machine
-            if (pos < num_prompt_tokens) {
-                // if we are still processing the input prompt, force the next prompt token
-                next = prompt_tokens[pos];
-            } else {
-                // otherwise sample the next token from the logits
-                next = sample(sampler, logits, temperature, topp);
-            }
-            pos++;
-
-            // data-dependent terminating condition: the BOS (1) token delimits sequences
-            if (next == 1) {
-                break;
-            }
-
-            // print the token as string, decode it with the Tokenizer object
-            String piece = decode(tokenizer, token, next);
-            System.out.print(piece);
-
-            System.out.flush();
-            token = next;
-
-            // init the timer here because the first iteration can be slower
-            if (start == 0) {
-                start = time_in_ms();
-            }
-        }
-
-        System.out.println();
-
-        // report achieved tok/s (pos-1 because the timer starts after first iteration)
-        if (pos > 1) {
-            long end = time_in_ms();
-            System.err.printf("\nachieved tok/s: %f\n", (pos - 1) / (double) (end - start) * 1000);
-        }
+        // run!
+        generate(transformer, tokenizer, sampler, prompt, steps);
     }
 }
