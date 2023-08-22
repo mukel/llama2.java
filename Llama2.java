@@ -304,6 +304,18 @@ class Llama2 {
                 }
                 val = sum0.add(sum1).add(sum2).add(sum3).reduceLanes(VectorOperators.ADD);
             }
+
+            // Graal's auto-vectorization.
+            int upperBound = n & ~3;
+            float[] sum = new float[4];
+            for (; j < upperBound; j += sum.length) {
+                sum[0] += w.get(i * n + j + 0) * x[j + 0];
+                sum[1] += w.get(i * n + j + 1) * x[j + 1];
+                sum[2] += w.get(i * n + j + 2) * x[j + 2];
+                sum[3] += w.get(i * n + j + 3) * x[j + 3];
+            }
+            val += sum[0] + sum[1] + sum[2] + sum[3];
+
             for (; j < n; j++) {
                 val += w.get(i * n + j) * x[j];
             }
