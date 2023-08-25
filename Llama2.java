@@ -491,10 +491,10 @@ class Llama2 {
     static String decode(Tokenizer t, int prev_token, int token) {
         String piece = t.vocab[token];
         // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-        if (prev_token == 1 && piece.charAt(0) == ' ') { piece = piece.substring(1); }
+        if (prev_token == 1 && piece.charAt(0) == ' ') {
+            piece = piece.substring(1);
+        }
         // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-        byte byte_val;
-
         String prefix = "<0x";
         String suffix = ">";
         if (piece.length() == 6 && piece.startsWith(prefix) && piece.endsWith(suffix)) {
@@ -502,12 +502,24 @@ class Llama2 {
             char ch = (char) Integer.parseInt(hex2, 16);
             // ok this token is a raw byte token, carefuly to only print printable chars or whitespace
             // some of the other bytes can be various control codes, backspace, etc. => skip
-            boolean isPrintable = (32 <= ch && ch < 127);
-            if (isPrintable || Character.isWhitespace(ch)) {
-                piece = Character.toString(ch);
-            }
+            piece = Character.toString(ch);
         }
         return piece;
+    }
+
+    static void safe_printf(String piece) {
+        // piece might be a raw byte token, and we only want to print printable chars or whitespace
+        // because some of the other bytes can be various control codes, backspace, etc.
+        if (piece == null) { return; }
+        if (piece.isEmpty()) { return; }
+        if (piece.length() == 1) {
+            char ch = piece.charAt(0);
+            boolean isPrintable = (32 <= ch && ch < 127);
+            if (!(isPrintable || Character.isWhitespace(ch))) {
+                return ;
+            }
+        }
+        System.out.print(piece);
     }
 
     static int str_lookup(String str, Map<String, Integer> sorted_vocab) {
@@ -515,8 +527,13 @@ class Llama2 {
         return sorted_vocab.getOrDefault(str, -1);
     }
 
-    static int encode(Tokenizer t, String text, int[] tokens) {
+    static int encode(Tokenizer t, String text, boolean bos, boolean eos, int[] tokens) {
         // encode the string text (input) into an upper-bound preallocated tokens[] array
+        // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
+        if (text == null) {
+            System.err.println("cannot encode NULL text");
+            System.exit(1);
+        }
 
         if (t.sorted_vocab == null) {
             // sort vocabulary
@@ -527,9 +544,21 @@ class Llama2 {
             }
         }
 
-        // add_dummy_prefix is true by default
-        tokens[0] = str_lookup(" ", t.sorted_vocab);
-        int n_tokens = 1; // the number of tokens
+        // start at 0 tokens
+        int n_tokens = 0; // the number of tokens
+
+        // add optional BOS (=1) token, if desired
+        if (bos) {
+            tokens[n_tokens++] = 1;
+        }
+
+        // so prepend a dummy prefix token to the input string, but only if text != ""
+        // TODO: pretty sure this isn't correct in the general case but I don't have the
+        // energy to read more of the sentencepiece code to figure out what it's doing
+        if (!"".equals(text)) {
+            int dummy_prefix = str_lookup(" ", t.sorted_vocab);
+            tokens[n_tokens++] = dummy_prefix;
+        }
 
         // first encode every individual codepoint in the input string
         for (int i = 0, cpi; i < text.length(); i += Character.charCount(cpi)) {
@@ -582,6 +611,11 @@ class Llama2 {
             n_tokens--; // token length decreased
         }
 
+        // add optional EOS (=2) token, if desired
+        if (eos) {
+            tokens[n_tokens++] = 2;
+        }
+
         return n_tokens;
     }
 
@@ -598,41 +632,42 @@ class Llama2 {
 // generation loop
 
     static void generate(Transformer transformer, Tokenizer tokenizer, Sampler sampler, String prompt, int steps) {
-        // encode the (string) prompt into tokens sequence, if any is given
-        int[] prompt_tokens = null; // the sequence of prompt tokens
+        // encode the (string) prompt into tokens sequence
         int num_prompt_tokens = 0; // the total number of prompt tokens
-        if (prompt != null) {
-            prompt_tokens = new int[prompt.length() * 2];
-            num_prompt_tokens = encode(tokenizer, prompt, prompt_tokens);
+        int[] prompt_tokens = new int[prompt.length() * 2 + 3]; // +3 for '\0', ?BOS, ?EOS
+        num_prompt_tokens = encode(tokenizer, prompt, true, false, prompt_tokens);
+        if (num_prompt_tokens < 1) {
+            System.err.println("something is wrong, expected at least 1 prompt token");
+            System.exit(1);
         }
 
         // start the main loop
         long start = 0;  // used to time our code, only initialized after first iteration
         int next;        // will store the next token in the sequence
-        int token = 1;   // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+        int token = prompt_tokens[0]; // kick off with the first token in the prompt
         int pos = 0;     // position in the sequence
         while (pos < steps) {
             // forward the transformer to get logits for the next token
             float[] logits = forward(transformer, token, pos);
 
             // advance the state machine
-            if (pos < num_prompt_tokens) {
+            if (pos < num_prompt_tokens - 1) {
                 // if we are still processing the input prompt, force the next prompt token
-                next = prompt_tokens[pos];
+                next = prompt_tokens[pos + 1];
             } else {
                 // otherwise sample the next token from the logits
                 next = sample(sampler, logits);
             }
             pos++;
 
-            // data-dependent terminating condition: the BOS (1) token delimits sequences
+            // data-dependent terminating condition: the BOS (=1) token delimits sequences
             if (next == 1) {
                 break;
             }
 
             // print the token as string, decode it with the Tokenizer object
             String piece = decode(tokenizer, token, next);
-            System.out.print(piece);
+            safe_printf(piece);
 
             System.out.flush();
             token = next;
@@ -809,7 +844,7 @@ class Llama2 {
         float topp = 0.9f;        // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
         long rng_seed = 0;        // seed rng with time by default
         int steps = 256;          // max number of steps to run for, 0: use seq_len
-        String prompt = null;     // prompt string
+        String prompt = "";       // prompt string
 
         // poor man's C argparse so we can override the defaults above from the command line
         if (args.length >= 1) {
@@ -850,7 +885,7 @@ class Llama2 {
 
         // build the Transformer via the model .bin file
         Transformer transformer = new Transformer(checkpoint_path);
-        if (steps == 0) {
+        if (steps == 0 || steps > transformer.config.seq_len) {
             steps = transformer.config.seq_len; // ovrerride to ~max length
         }
 
