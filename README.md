@@ -12,12 +12,19 @@ Besides the educational value, this project will be used to test and tune compil
 This port used [llama2.scala](https://github.com/jrudolph/llama2.scala) initially as a reference.
 
 ## Build
-Java 20+ is required, in particular the [`MemorySegment` mmap-ing feature](https://docs.oracle.com/en/java/javase/20/docs/api/java.base/java/nio/channels/FileChannel.html#map(java.nio.channels.FileChannel.MapMode,long,long,java.lang.foreign.SegmentScope)).  
+Java 21+ is required, in particular the [`MemorySegment` mmap-ing feature](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/channels/FileChannel.html#map(java.nio.channels.FileChannel.MapMode,long,long,java.lang.foreign.Arena)).  
+
 The code expects [`tokenizer.bin`](https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin) in the current directory.
+You can use [TinyStories](https://huggingface.co/karpathy/tinyllamas/tree/main) checkpoints or get LLama2 models by [following instructions](https://github.com/karpathy/llama2.c#metas-llama-2-models).
+
+```bash
+wget https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin
+wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+```
 
 To build and run manually:
 ```bash
-javac --enable-preview -source 20 --add-modules=jdk.incubator.vector Llama2.java
+javac --enable-preview -source 21 --add-modules=jdk.incubator.vector Llama2.java
 java --enable-preview --add-modules=jdk.incubator.vector Llama2 stories15M.bin
 ```
 
