@@ -1,6 +1,6 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
-//JAVA 20
-//COMPILE_OPTIONS --enable-preview -source 20 --add-modules=jdk.incubator.vector
+//JAVA 21
+//COMPILE_OPTIONS --enable-preview -source 21 --add-modules=jdk.incubator.vector
 //RUNTIME_OPTIONS --enable-preview --add-modules=jdk.incubator.vector
 //NATIVE_OPTIONS  --enable-preview --add-modules=jdk.incubator.vector --initialize-at-build-time=Llama2 -Dllama2.VectorAPI=false
 
