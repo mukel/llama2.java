@@ -1,5 +1,7 @@
 # A Java port of Andrej Karpathy's llama2.c
 
+****Check the successor of this project: [Llama3.java](https://github.com/mukel/llama3.java): Practical Llama (3) inference in a single Java file, with additional features, including a `--chat` mode.**
+
 This is a pure Java port of Andrej Karpathy's awesome [llama2.c](https://github.com/karpathy/llama2.c), a very simple implementation
 to run inference of models with a [Llama2](https://arxiv.org/pdf/2302.13971.pdf)-like transformer-based LLM architecture.  
 
